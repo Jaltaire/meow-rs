@@ -911,9 +911,6 @@ impl BoringInner {
                     .map_err(|e| TransportError::Config(format!("boring: set_curves_list: {e}")))?;
                 b.set_grease_enabled(p.grease);
                 b.set_permute_extensions(p.permute_extensions);
-                b.set_sigalgs_list(p.sigalgs_list).map_err(|e| {
-                    TransportError::Config(format!("boring: set_sigalgs_list: {e}"))
-                })?;
             } else {
                 // Deferred profile — warn and continue with boring defaults.
                 warn!(
