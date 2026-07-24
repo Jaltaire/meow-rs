@@ -634,7 +634,7 @@ const CHROME: FingerprintParams = FingerprintParams {
                   AES256-SHA",
     curves_list: "X25519:P-256:P-384",
     grease: true,
-    permute_extensions: false,
+    permute_extensions: true,
     sigalgs_list: "ecdsa_secp256r1_sha256:\
                    rsa_pss_rsae_sha256:\
                    rsa_pkcs1_sha256:\
