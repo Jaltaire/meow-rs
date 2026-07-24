@@ -89,7 +89,7 @@ httparse = { version = "1", optional = true }
 # boring-tls feature
 boring             = { workspace = true, optional = true }
 tokio-boring       = { workspace = true, optional = true }
-boring-sys         = { version = "5.0.2", optional = true }
+boring-sys         = { package = "boring-sys2", version = "4.15.11", optional = true }
 # Mozilla CA bundle for boring's X509Store. The BoringSSL connector
 # starts with an *empty* trust store; sandboxed runtimes (iOS
 # NetworkExtension, sealed app extensions) don't pick up system roots

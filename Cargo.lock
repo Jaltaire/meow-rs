@@ -464,28 +464,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "boring"
-version = "5.1.0"
+name = "boring-sys2"
+version = "4.15.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b573999d5cb0fdb9e9bb495058981752547b6475ba5e346247ebbd329917549"
+checksum = "ab6c876a958d17057d9d3a31075bb9609237413a1fe665432782c31ef596eb6b"
 dependencies = [
- "bitflags 2.11.1",
- "boring-sys",
- "foreign-types",
- "libc",
- "openssl-macros",
-]
-
-[[package]]
-name = "boring-sys"
-version = "5.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbc39169cb8fa025002661c8d9148ed38a896908e4d308bb0cb55303f66e95d4"
-dependencies = [
+ "autocfg",
  "bindgen",
  "cmake",
  "fs_extra",
  "fslock",
+]
+
+[[package]]
+name = "boring2"
+version = "4.15.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4470e96bd94533c2f88c08be95a8e6d2d37a3b497a773b0a46273a376978f00"
+dependencies = [
+ "bitflags 2.11.1",
+ "boring-sys2",
+ "foreign-types",
+ "libc",
+ "openssl-macros",
 ]
 
 [[package]]
@@ -2659,8 +2660,8 @@ dependencies = [
  "aes-gcm",
  "async-trait",
  "base64",
- "boring",
- "boring-sys",
+ "boring-sys2",
+ "boring2",
  "bytes",
  "futures-util",
  "h2",
@@ -2675,7 +2676,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tokio",
- "tokio-boring",
+ "tokio-boring2",
  "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
@@ -4363,13 +4364,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-boring"
-version = "5.0.0"
+name = "tokio-boring2"
+version = "4.15.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "888f55b68689784b01b8625c9c1486080d8a790972355d45a1bef231b5f5aa83"
+checksum = "3866209c48e3d69e709a9d6105d7e2aa34e4374bc5dcaec32e0f8e53a28db14a"
 dependencies = [
- "boring",
- "boring-sys",
+ "boring-sys2",
+ "boring2",
  "tokio",
 ]
 
