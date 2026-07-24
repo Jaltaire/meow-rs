@@ -207,8 +207,8 @@ parking_lot = "0.12"
 # Wait-free read / atomic swap for hot-path rule-set + proxy-provider refreshes
 
 # BoringSSL (pulled in by meow-transport's boring-tls feature)
-boring      = { package = "boring2", version = "4.15.11" }
-tokio-boring = { package = "tokio-boring2", version = "4.15.11" }
+boring      = { package = "boring2", version = "4.15.11", features = ["pq-experimental"] }
+tokio-boring = { package = "tokio-boring2", version = "4.15.11", features = ["pq-experimental"] }
 
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
