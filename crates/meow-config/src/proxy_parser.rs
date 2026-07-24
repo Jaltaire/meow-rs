@@ -1146,7 +1146,7 @@ fn parse_vless(
         let sni = if servername.is_empty() {
             server.to_string()
         } else {
-            servername
+            servername.clone()
         };
         let mut tls_cfg = TlsConfig::new(sni);
         tls_cfg.skip_cert_verify = skip_cert_verify;
@@ -1232,16 +1232,13 @@ fn parse_vless(
             let service_name = grpc_opts
                 .and_then(|o| o.get("grpc-service-name"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("GunService")
+                .unwrap_or_default()
                 .to_string();
-            // Authority: use the outbound server address so the gRPC virtual
-            // host matches the TLS SNI. Upstream hard-codes "localhost" when
-            // unset; we normalise here per ADR-0001 §1 (transport never infers
-            // context-sensitive values).
-            let authority = server.to_string();
+            let authority = vless_grpc_authority(server, port, tls, &servername);
             let grpc_cfg = GrpcConfig {
                 service_name,
                 authority,
+                secure: tls,
             };
             chain.push(Box::new(GrpcLayer::new(grpc_cfg)));
         }
@@ -1321,6 +1318,18 @@ fn parse_vless(
     #[cfg(feature = "vless-encryption")]
     adapter.set_encryption(vless_encryption);
     Ok(adapter)
+}
+
+#[cfg(feature = "vless")]
+fn vless_grpc_authority(server: &str, port: u16, secure: bool, servername: &str) -> String {
+    if secure {
+        return servername.to_string();
+    }
+    if server.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{server}]:{port}")
+    } else {
+        format!("{server}:{port}")
+    }
 }
 
 /// Parse the VLESS `encryption` field.
@@ -1895,6 +1904,23 @@ mod tests {
         assert_eq!(decoded.len(), 32);
         // Garbage is still rejected.
         assert!(decode_raw_url_base64_lenient("!!!not base64!!!").is_none());
+    }
+
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_grpc_authority_matches_secure_and_plaintext_targets() {
+        assert_eq!(
+            vless_grpc_authority("198.51.100.10", 8880, false, "unused.example.com"),
+            "198.51.100.10:8880"
+        );
+        assert_eq!(
+            vless_grpc_authority("2001:db8::1", 8880, false, "unused.example.com"),
+            "[2001:db8::1]:8880"
+        );
+        assert_eq!(
+            vless_grpc_authority("198.51.100.10", 443, true, "sni.example.com"),
+            "sni.example.com"
+        );
     }
 
     #[test]

@@ -85,7 +85,7 @@ serde_yaml = "0.9"
 # which meow's adapter requires (madeye/anytls-rs#1, #201 item 4); vendoring the
 # madeye fork removes the registry/git dependency entirely. See #262 and
 # crates/meow-anytls/README.md.
-shadowsocks = { version = "1.21", default-features = false, features = ["aead-cipher", "aead-cipher-2022", "stream-cipher"] }
+shadowsocks = { version = "1.21", default-features = false, features = ["aead-cipher", "aead-cipher-2022", "aead-cipher-extra", "stream-cipher"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 quinn = { version = "0.11", default-features = false, features = ["log", "ring", "runtime-tokio", "rustls-ring"] }

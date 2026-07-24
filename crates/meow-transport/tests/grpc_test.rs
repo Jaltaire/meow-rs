@@ -16,12 +16,120 @@ mod support;
 
 use std::time::Duration;
 
-use meow_transport::grpc::{decode_gun_frame, encode_gun_frame, GrpcConfig, GrpcLayer};
+use bytes::Bytes;
 use meow_transport::Transport;
 use meow_transport::TransportError;
+use meow_transport::grpc::{GrpcConfig, GrpcLayer, decode_gun_frame, encode_gun_frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use support::loopback::spawn_grpc_server;
+
+#[derive(Clone, Copy)]
+enum TerminalResponse {
+    HttpFailure,
+    InitialFailure,
+    InitialSuccess,
+    TrailerFailure,
+    MissingTrailers,
+    TruncatedFrame,
+}
+
+async fn spawn_terminal_server(response: TerminalResponse) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("The terminal gRPC server should bind.");
+    let address = listener
+        .local_addr()
+        .expect("The terminal gRPC server should have an address.");
+    tokio::spawn(async move {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("The terminal gRPC server should accept a connection.");
+        let mut connection = h2::server::handshake(stream)
+            .await
+            .expect("The terminal gRPC HTTP/2 handshake should succeed.");
+        let (_, mut sender) = connection
+            .accept()
+            .await
+            .expect("The terminal gRPC request should arrive.")
+            .expect("The terminal gRPC request should be valid.");
+        tokio::spawn(async move { while connection.accept().await.is_some() {} });
+
+        match response {
+            TerminalResponse::HttpFailure => {
+                let response = http::Response::builder()
+                    .status(421)
+                    .body(())
+                    .expect("The HTTP failure response should be valid.");
+                sender
+                    .send_response(response, true)
+                    .expect("The HTTP failure response should be sent.");
+            }
+            TerminalResponse::InitialFailure | TerminalResponse::InitialSuccess => {
+                let status = match response {
+                    TerminalResponse::InitialFailure => "12",
+                    TerminalResponse::InitialSuccess => "0",
+                    _ => unreachable!(),
+                };
+                let response = http::Response::builder()
+                    .status(200)
+                    .header("grpc-status", status)
+                    .header("grpc-message", "The initial status ended the request.")
+                    .body(())
+                    .expect("The initial gRPC status response should be valid.");
+                sender
+                    .send_response(response, true)
+                    .expect("The initial gRPC status response should be sent.");
+            }
+            TerminalResponse::TrailerFailure => {
+                let response = http::Response::builder()
+                    .status(200)
+                    .body(())
+                    .expect("The trailer failure response should be valid.");
+                let mut body = sender
+                    .send_response(response, false)
+                    .expect("The trailer failure response should be sent.");
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("grpc-status", http::HeaderValue::from_static("13"));
+                trailers.insert(
+                    "grpc-message",
+                    http::HeaderValue::from_static("The trailer ended the request."),
+                );
+                body.send_trailers(trailers)
+                    .expect("The failure trailers should be sent.");
+            }
+            TerminalResponse::MissingTrailers | TerminalResponse::TruncatedFrame => {
+                let http_response = http::Response::builder()
+                    .status(200)
+                    .body(())
+                    .expect("The incomplete gRPC response should be valid.");
+                let mut body = sender
+                    .send_response(http_response, false)
+                    .expect("The incomplete gRPC response should be sent.");
+                let data = match response {
+                    TerminalResponse::MissingTrailers => Bytes::new(),
+                    TerminalResponse::TruncatedFrame => Bytes::from_static(&[0x00, 0x00]),
+                    _ => unreachable!(),
+                };
+                body.send_data(data, true)
+                    .expect("The incomplete gRPC body should be sent.");
+            }
+        }
+    });
+    address
+}
+
+async fn terminal_stream(response: TerminalResponse) -> Box<dyn meow_transport::Stream> {
+    let address = spawn_terminal_server(response).await;
+    let tcp = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("The terminal gRPC client should connect.");
+    GrpcLayer::new(GrpcConfig::default())
+        .connect(Box::new(tcp))
+        .await
+        .expect("The gRPC transport should return before the response arrives.")
+}
 
 async fn assert_grpc_config_error(config: GrpcConfig, expected: &str) {
     let (client, _server) = tokio::io::duplex(64);
@@ -275,4 +383,73 @@ async fn grpc_round_trip() {
         "received byte count must match sent byte count"
     );
     assert_eq!(recv_buf, send_buf, "round-trip bytes must be identical");
+}
+
+#[tokio::test]
+async fn grpc_reports_http_initial_and_trailer_failures() {
+    for (response, expected) in [
+        (TerminalResponse::HttpFailure, "HTTP status 421"),
+        (TerminalResponse::InitialFailure, "initial status ended"),
+        (TerminalResponse::TrailerFailure, "trailer ended"),
+    ] {
+        let mut stream = terminal_stream(response).await;
+        let mut byte = [0u8; 1];
+        let error = stream
+            .read(&mut byte)
+            .await
+            .expect_err("The terminal gRPC failure should be reported.");
+        assert!(
+            error.to_string().contains(expected),
+            "The gRPC error should contain {expected:?}, but it was {error:?}."
+        );
+        assert_eq!(
+            stream
+                .read(&mut byte)
+                .await
+                .expect("A repeated read after a terminal gRPC error should produce EOF."),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn grpc_accepts_a_successful_initial_status() {
+    let mut stream = terminal_stream(TerminalResponse::InitialSuccess).await;
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        stream
+            .read(&mut byte)
+            .await
+            .expect("The successful initial gRPC status should produce EOF."),
+        0
+    );
+    assert_eq!(
+        stream
+            .read(&mut byte)
+            .await
+            .expect("Repeated reads after gRPC EOF should remain at EOF."),
+        0
+    );
+}
+
+#[tokio::test]
+async fn grpc_rejects_missing_trailers_and_truncated_frames() {
+    for response in [
+        TerminalResponse::MissingTrailers,
+        TerminalResponse::TruncatedFrame,
+    ] {
+        let mut stream = terminal_stream(response).await;
+        let mut byte = [0u8; 1];
+        stream
+            .read(&mut byte)
+            .await
+            .expect_err("The incomplete gRPC response should be rejected.");
+        assert_eq!(
+            stream
+                .read(&mut byte)
+                .await
+                .expect("A repeated read after an incomplete response should produce EOF."),
+            0
+        );
+    }
 }

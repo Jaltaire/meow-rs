@@ -235,7 +235,8 @@ pub async fn spawn_grpc_server() -> (
         // and processes all connection-level frames.
         tokio::spawn(async move { while conn.accept().await.is_some() {} });
 
-        // Send a 200 OK with end_of_stream=false (streaming response).
+        let mut body = req.into_body();
+        let first_data = std::future::poll_fn(|cx| body.poll_data(cx)).await;
         let response = http::Response::builder()
             .status(200)
             .body(())
@@ -243,9 +244,17 @@ pub async fn spawn_grpc_server() -> (
         let Ok(mut send) = respond.send_response(response, false) else {
             return;
         };
+        match first_data {
+            Some(Ok(data)) => {
+                let _ = body.flow_control().release_capacity(data.len());
+                if send.send_data(data, false).is_err() {
+                    return;
+                }
+            }
+            None => {}
+            Some(Err(_)) => return,
+        }
 
-        // Echo every DATA frame back verbatim (same gun-framed bytes).
-        let mut body = req.into_body();
         loop {
             let data = std::future::poll_fn(|cx| body.poll_data(cx)).await;
             match data {
@@ -260,8 +269,9 @@ pub async fn spawn_grpc_server() -> (
             }
         }
 
-        // Close the response stream.
-        let _ = send.send_data(bytes::Bytes::new(), true);
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+        let _ = send.send_trailers(trailers);
     });
 
     (addr, rx)

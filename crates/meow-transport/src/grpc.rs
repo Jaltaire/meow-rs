@@ -28,6 +28,7 @@
 //! `content-type: application/grpc`
 //! `te: trailers`
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -57,6 +58,8 @@ pub struct GrpcConfig {
     ///
     /// task #70: pre-VLESS hardening — must be set before gRPC-over-VLESS lands.
     pub authority: String,
+
+    pub secure: bool,
 }
 
 impl Default for GrpcConfig {
@@ -64,6 +67,7 @@ impl Default for GrpcConfig {
         Self {
             service_name: "GunService".into(),
             authority: "localhost".into(),
+            secure: false,
         }
     }
 }
@@ -82,21 +86,26 @@ impl GrpcLayer {
     }
 }
 
+fn build_request(config: &GrpcConfig) -> Result<http::Request<()>> {
+    let path = format!("/{}/Tun", config.service_name);
+    let scheme = if config.secure { "https" } else { "http" };
+    http::Request::builder()
+        .method(http::Method::POST)
+        .uri(format!("{scheme}://{}{}", config.authority, path))
+        .header(http::header::CONTENT_TYPE, "application/grpc")
+        .header(http::header::USER_AGENT, "grpc-rust/meow-transport")
+        .header("te", "trailers")
+        .body(())
+        .map_err(|error| TransportError::Config(format!("grpc: invalid request config: {error}")))
+}
+
 #[async_trait]
 impl Transport for GrpcLayer {
     async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
-        let path = format!("/{}/Tun", self.config.service_name);
-
         // Build and validate the request before opening the h2 connection.
         // Invalid service names or authorities are configuration errors, not
         // transport-handshake failures.
-        let request = http::Request::builder()
-            .method(http::Method::POST)
-            .uri(format!("http://{}{}", self.config.authority, path))
-            .header(http::header::CONTENT_TYPE, "application/grpc")
-            .header("te", "trailers")
-            .body(())
-            .map_err(|e| TransportError::Config(format!("grpc: invalid request config: {e}")))?;
+        let request = build_request(&self.config)?;
 
         // Perform the HTTP/2 client handshake over the inner stream.
         let (mut h2, conn) = h2::client::handshake(inner)
@@ -115,13 +124,7 @@ impl Transport for GrpcLayer {
             .send_request(request, false)
             .map_err(|e| TransportError::Grpc(e.to_string()))?;
 
-        // Await the server's 200 response to get the response body stream.
-        let response = response_future
-            .await
-            .map_err(|e| TransportError::Grpc(e.to_string()))?;
-        let recv_stream = response.into_body();
-
-        Ok(Box::new(GunStream::new(send_stream, recv_stream)))
+        Ok(Box::new(GunStream::new(send_stream, response_future)))
     }
 }
 
@@ -259,7 +262,10 @@ const MAX_GUN_FRAME_LEN: usize = 16 * 1024 * 1024;
 /// A bidirectional gRPC-framed stream over a single h2 request/response pair.
 struct GunStream {
     send: h2::SendStream<Bytes>,
-    recv: h2::RecvStream,
+    response: Option<h2::client::ResponseFuture>,
+    recv: Option<h2::RecvStream>,
+    data_finished: bool,
+    read_finished: bool,
     /// Decoded payload bytes from the most-recently parsed gun frame.
     read_buf: Bytes,
     /// Raw h2 DATA bytes accumulating across multiple `poll_data` calls until
@@ -273,15 +279,40 @@ struct GunStream {
 }
 
 impl GunStream {
-    fn new(send: h2::SendStream<Bytes>, recv: h2::RecvStream) -> Self {
+    fn new(send: h2::SendStream<Bytes>, response: h2::client::ResponseFuture) -> Self {
         Self {
             send,
-            recv,
+            response: Some(response),
+            recv: None,
+            data_finished: false,
+            read_finished: false,
             read_buf: Bytes::new(),
             pending_frame: Vec::new(),
             pending_write: None,
         }
     }
+}
+
+fn grpc_status_error(headers: &http::HeaderMap) -> io::Result<()> {
+    let Some(value) = headers.get("grpc-status") else {
+        return Ok(());
+    };
+    let status = value.to_str().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("grpc: invalid grpc-status header: {error}"),
+        )
+    })?;
+    if status == "0" {
+        return Ok(());
+    }
+    let message = headers
+        .get("grpc-message")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("The server did not provide a gRPC error message.");
+    Err(io::Error::other(format!(
+        "grpc: server returned status {status}. {message}"
+    )))
 }
 
 impl AsyncRead for GunStream {
@@ -293,6 +324,42 @@ impl AsyncRead for GunStream {
         let this = self.get_mut();
 
         loop {
+            if this.read_finished {
+                return Poll::Ready(Ok(()));
+            }
+
+            if this.recv.is_none() {
+                let response = this
+                    .response
+                    .as_mut()
+                    .expect("The gRPC response future must exist until it resolves.");
+                match Pin::new(response).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => {
+                        this.response = None;
+                        this.read_finished = true;
+                        return Poll::Ready(Err(io::Error::other(error)));
+                    }
+                    Poll::Ready(Ok(response)) => {
+                        this.response = None;
+                        if !response.status().is_success() {
+                            this.read_finished = true;
+                            return Poll::Ready(Err(io::Error::other(format!(
+                                "grpc: server returned HTTP status {}.",
+                                response.status()
+                            ))));
+                        }
+                        if let Err(error) = grpc_status_error(response.headers()) {
+                            this.read_finished = true;
+                            return Poll::Ready(Err(error));
+                        }
+                        this.read_finished = response.headers().contains_key("grpc-status");
+                        this.recv = Some(response.into_body());
+                        continue;
+                    }
+                }
+            }
+
             // ── Drain any decoded payload from the current frame ──────────────
             if !this.read_buf.is_empty() {
                 let n = this.read_buf.len().min(buf.remaining());
@@ -347,16 +414,60 @@ impl AsyncRead for GunStream {
                     .reserve(frame_len - this.pending_frame.len());
             }
 
+            let recv = this
+                .recv
+                .as_mut()
+                .expect("The gRPC response stream must exist after the response resolves.");
+            if this.data_finished {
+                if !this.pending_frame.is_empty() {
+                    this.read_finished = true;
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "grpc: the server closed with {} bytes of an incomplete frame.",
+                            this.pending_frame.len()
+                        ),
+                    )));
+                }
+                return match recv.poll_trailers(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Err(error)) => {
+                        this.read_finished = true;
+                        Poll::Ready(Err(io::Error::other(error)))
+                    }
+                    Poll::Ready(Ok(Some(trailers))) => match grpc_status_error(&trailers) {
+                        Ok(()) => {
+                            this.read_finished = true;
+                            Poll::Ready(Ok(()))
+                        }
+                        Err(error) => {
+                            this.read_finished = true;
+                            Poll::Ready(Err(error))
+                        }
+                    },
+                    Poll::Ready(Ok(None)) => {
+                        this.read_finished = true;
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "grpc: the server closed the stream without trailers.",
+                        )))
+                    }
+                };
+            }
+
             // ── Need more bytes from the h2 DATA stream ───────────────────────
-            match this.recv.poll_data(cx) {
+            match recv.poll_data(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(Ok(())), // clean EOF
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::other(e)));
+                Poll::Ready(None) => {
+                    this.data_finished = true;
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    this.read_finished = true;
+                    return Poll::Ready(Err(io::Error::other(error)));
                 }
                 Poll::Ready(Some(Ok(bytes))) => {
                     // Release flow-control window back to the sender.
-                    let _ = this.recv.flow_control().release_capacity(bytes.len());
+                    let _ = recv.flow_control().release_capacity(bytes.len());
                     this.pending_frame.extend_from_slice(&bytes);
                     // loop → re-check pending_frame for a complete frame
                 }
@@ -424,3 +535,82 @@ impl AsyncWrite for GunStream {
 }
 
 impl Unpin for GunStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::{GrpcConfig, build_request, grpc_status_error};
+
+    #[test]
+    fn request_matches_plaintext_and_secure_grpc_metadata() {
+        let plaintext = build_request(&GrpcConfig {
+            service_name: String::new(),
+            authority: "127.0.0.1:8080".into(),
+            secure: false,
+        })
+        .expect("The plaintext gRPC request should be valid.");
+        assert_eq!(plaintext.uri().scheme_str(), Some("http"));
+        assert_eq!(
+            plaintext.uri().authority().map(|value| value.as_str()),
+            Some("127.0.0.1:8080")
+        );
+        assert_eq!(plaintext.uri().path(), "//Tun");
+        assert_eq!(
+            plaintext
+                .headers()
+                .get(http::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some("grpc-rust/meow-transport")
+        );
+
+        let secure = build_request(&GrpcConfig {
+            secure: true,
+            ..GrpcConfig::default()
+        })
+        .expect("The secure gRPC request should be valid.");
+        assert_eq!(secure.uri().scheme_str(), Some("https"));
+        assert_eq!(secure.uri().path(), "/GunService/Tun");
+    }
+
+    #[test]
+    fn grpc_status_accepts_absent_and_success_statuses() {
+        let absent = http::HeaderMap::new();
+        grpc_status_error(&absent).expect("An absent initial gRPC status should be accepted.");
+
+        let mut success = http::HeaderMap::new();
+        success.insert("grpc-status", http::HeaderValue::from_static("0"));
+        grpc_status_error(&success).expect("A successful gRPC status should be accepted.");
+    }
+
+    #[test]
+    fn grpc_status_reports_server_messages_and_invalid_values() {
+        let mut with_message = http::HeaderMap::new();
+        with_message.insert("grpc-status", http::HeaderValue::from_static("12"));
+        with_message.insert(
+            "grpc-message",
+            http::HeaderValue::from_static("The method is unavailable."),
+        );
+        let error = grpc_status_error(&with_message)
+            .expect_err("A nonzero gRPC status should be rejected.");
+        assert!(error.to_string().contains("The method is unavailable."));
+
+        let mut without_message = http::HeaderMap::new();
+        without_message.insert("grpc-status", http::HeaderValue::from_static("13"));
+        let error = grpc_status_error(&without_message)
+            .expect_err("A nonzero gRPC status should be rejected.");
+        assert!(
+            error
+                .to_string()
+                .contains("The server did not provide a gRPC error message.")
+        );
+
+        let mut invalid = http::HeaderMap::new();
+        invalid.insert(
+            "grpc-status",
+            http::HeaderValue::from_bytes(&[0xff])
+                .expect("The invalid text header value should still be representable."),
+        );
+        let error =
+            grpc_status_error(&invalid).expect_err("An invalid gRPC status should be rejected.");
+        assert!(error.to_string().contains("invalid grpc-status header"));
+    }
+}
