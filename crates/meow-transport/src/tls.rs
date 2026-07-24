@@ -634,7 +634,7 @@ const CHROME: FingerprintParams = FingerprintParams {
                   AES256-SHA",
     curves_list: "X25519:P-256:P-384",
     grease: true,
-    permute_extensions: false,
+    permute_extensions: true,
     sigalgs_list: "ecdsa_secp256r1_sha256:\
                    rsa_pss_rsae_sha256:\
                    rsa_pkcs1_sha256:\
@@ -911,6 +911,9 @@ impl BoringInner {
                     .map_err(|e| TransportError::Config(format!("boring: set_curves_list: {e}")))?;
                 b.set_grease_enabled(p.grease);
                 b.set_permute_extensions(p.permute_extensions);
+                b.set_sigalgs_list(p.sigalgs_list).map_err(|e| {
+                    TransportError::Config(format!("boring: set_sigalgs_list: {e}"))
+                })?;
             } else {
                 // Deferred profile — warn and continue with boring defaults.
                 warn!(
