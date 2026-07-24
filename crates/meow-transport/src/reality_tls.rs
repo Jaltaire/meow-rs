@@ -1484,7 +1484,7 @@ mod tests {
             .decrypt_in_place_detached(nonce, &aad, &mut buf, Tag::from_slice(tag))
             .expect("session_id must decrypt under the server-derived key");
 
-        assert_eq!(&buf[0..4], &[1, 8, 2, 0], "reality auth header");
+        assert_eq!(&buf[0..4], &[1, 8, 0, 0], "reality auth header");
         assert_eq!(&buf[8..16], &reality.short_id, "short_id echoed");
     }
 
